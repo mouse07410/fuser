@@ -23,45 +23,25 @@
 #![warn(missing_debug_implementations)]
 #![allow(missing_docs)]
 
-use bitflags::bitflags;
 use num_enum::TryFromPrimitive;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
 
+use crate::ll::flags::fattr_flags::FattrFlags;
+
 pub(crate) const FUSE_KERNEL_VERSION: u32 = 7;
 
-#[cfg(not(feature = "abi-7-20"))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 19;
-#[cfg(all(feature = "abi-7-20", not(feature = "abi-7-21")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 20;
-#[cfg(all(feature = "abi-7-21", not(feature = "abi-7-22")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 21;
-#[cfg(all(feature = "abi-7-22", not(feature = "abi-7-23")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 22;
-#[cfg(all(feature = "abi-7-23", not(feature = "abi-7-24")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 23;
-#[cfg(all(feature = "abi-7-24", not(feature = "abi-7-25")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 24;
-#[cfg(all(feature = "abi-7-25", not(feature = "abi-7-26")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 25;
-#[cfg(all(feature = "abi-7-26", not(feature = "abi-7-27")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 26;
-#[cfg(all(feature = "abi-7-27", not(feature = "abi-7-28")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 27;
-#[cfg(all(feature = "abi-7-28", not(feature = "abi-7-29")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 28;
-#[cfg(all(feature = "abi-7-29", not(feature = "abi-7-30")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 29;
-#[cfg(all(feature = "abi-7-30", not(feature = "abi-7-31")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 30;
-#[cfg(all(feature = "abi-7-31", not(feature = "abi-7-36")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
-#[cfg(all(feature = "abi-7-36", not(feature = "abi-7-40")))]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 36;
-#[cfg(feature = "abi-7-40")]
-pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = 40;
+pub(crate) const FUSE_KERNEL_MINOR_VERSION: u32 = if cfg!(target_os = "macos") {
+    // macfuse headers declared the latest version as 19.
+    // In theory, it is supposed to quietly handle a newer version, but
+    // we are not sure, and it may break if the release new version.
+    // So let's declare protocol version 19 to be safe.
+    19
+} else {
+    40
+};
 
 #[repr(C)]
 #[derive(Debug, IntoBytes, Clone, Copy, KnownLayout, Immutable)]
@@ -121,187 +101,12 @@ pub(crate) struct fuse_file_lock {
     pub(crate) pid: u32,
 }
 
-bitflags! {
-    /// Flags returned in open response.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct FopenFlags: u32 {
-        /// bypass page cache for this open file
-        const FOPEN_DIRECT_IO = 1 << 0;
-        /// don't invalidate the data cache on open
-        const FOPEN_KEEP_CACHE = 1 << 1;
-        /// the file is not seekable
-        const FOPEN_NONSEEKABLE = 1 << 2;
-        /// allow caching this directory
-        const FOPEN_CACHE_DIR = 1 << 3;
-        /// the file is stream-like (no file position at all)
-        const FOPEN_STREAM = 1 << 4;
-        /// kernel skips sending FUSE_FLUSH on close
-        const FOPEN_NOFLUSH = 1 << 5;
-        /// allow multiple concurrent writes on the same direct-IO file
-        const FOPEN_PARALLEL_DIRECT_WRITES = 1 << 6;
-        /// the file is fd-backed (via the backing_id field)
-        const FOPEN_PASSTHROUGH = 1 << 7;
-        #[cfg(target_os = "macos")]
-        const FOPEN_PURGE_ATTR = 1 << 30;
-        #[cfg(target_os = "macos")]
-        const FOPEN_PURGE_UBC = 1 << 31;
-    }
-
-    /// Flags for setattr operations (fuse_setattr_in.valid bitmask).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub(crate) struct FattrFlags: u32 {
-        const FATTR_MODE = 1 << 0;
-        const FATTR_UID = 1 << 1;
-        const FATTR_GID = 1 << 2;
-        const FATTR_SIZE = 1 << 3;
-        const FATTR_ATIME = 1 << 4;
-        const FATTR_MTIME = 1 << 5;
-        const FATTR_FH = 1 << 6;
-        const FATTR_ATIME_NOW = 1 << 7;
-        const FATTR_MTIME_NOW = 1 << 8;
-        const FATTR_LOCKOWNER = 1 << 9;
-        const FATTR_CTIME = 1 << 10;
-        #[cfg(target_os = "macos")]
-        const FATTR_CRTIME = 1 << 28;
-        #[cfg(target_os = "macos")]
-        const FATTR_CHGTIME = 1 << 29;
-        #[cfg(target_os = "macos")]
-        const FATTR_BKUPTIME = 1 << 30;
-        #[cfg(target_os = "macos")]
-        const FATTR_FLAGS = 1 << 31;
-    }
-
-    /// Init request/reply flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct InitFlags: u64 {
-        /// asynchronous read requests
-        const FUSE_ASYNC_READ = 1 << 0;
-        /// remote locking for POSIX file locks
-        const FUSE_POSIX_LOCKS = 1 << 1;
-        /// kernel sends file handle for fstat, etc...
-        const FUSE_FILE_OPS = 1 << 2;
-        /// handles the O_TRUNC open flag in the filesystem
-        const FUSE_ATOMIC_O_TRUNC = 1 << 3;
-        /// filesystem handles lookups of "." and ".."
-        const FUSE_EXPORT_SUPPORT = 1 << 4;
-        /// filesystem can handle write size larger than 4kB
-        const FUSE_BIG_WRITES = 1 << 5;
-        /// don't apply umask to file mode on create operations
-        const FUSE_DONT_MASK = 1 << 6;
-        /// kernel supports splice write on the device
-        const FUSE_SPLICE_WRITE = 1 << 7;
-        /// kernel supports splice move on the device
-        const FUSE_SPLICE_MOVE = 1 << 8;
-        /// kernel supports splice read on the device
-        const FUSE_SPLICE_READ = 1 << 9;
-        /// remote locking for BSD style file locks
-        const FUSE_FLOCK_LOCKS = 1 << 10;
-        /// kernel supports ioctl on directories
-        const FUSE_HAS_IOCTL_DIR = 1 << 11;
-        /// automatically invalidate cached pages
-        const FUSE_AUTO_INVAL_DATA = 1 << 12;
-        /// do READDIRPLUS (READDIR+LOOKUP in one)
-        const FUSE_DO_READDIRPLUS = 1 << 13;
-        /// adaptive readdirplus
-        const FUSE_READDIRPLUS_AUTO = 1 << 14;
-        /// asynchronous direct I/O submission
-        const FUSE_ASYNC_DIO = 1 << 15;
-        /// use writeback cache for buffered writes
-        const FUSE_WRITEBACK_CACHE = 1 << 16;
-        /// kernel supports zero-message opens
-        const FUSE_NO_OPEN_SUPPORT = 1 << 17;
-        /// allow parallel lookups and readdir
-        const FUSE_PARALLEL_DIROPS = 1 << 18;
-        /// fs handles killing suid/sgid/cap on write/chown/trunc
-        const FUSE_HANDLE_KILLPRIV = 1 << 19;
-        /// filesystem supports posix acls
-        const FUSE_POSIX_ACL = 1 << 20;
-        /// reading the device after abort returns ECONNABORTED
-        const FUSE_ABORT_ERROR = 1 << 21;
-        /// init_out.max_pages contains the max number of req pages
-        const FUSE_MAX_PAGES = 1 << 22;
-        /// cache READLINK responses
-        const FUSE_CACHE_SYMLINKS = 1 << 23;
-        /// kernel supports zero-message opendir
-        const FUSE_NO_OPENDIR_SUPPORT = 1 << 24;
-        /// only invalidate cached pages on explicit request
-        const FUSE_EXPLICIT_INVAL_DATA = 1 << 25;
-        /// map_alignment field is valid
-        const FUSE_MAP_ALIGNMENT = 1 << 26;
-        /// filesystem supports submounts
-        const FUSE_SUBMOUNTS = 1 << 27;
-        /// fs handles killing suid/sgid/cap on write/chown/trunc (v2)
-        const FUSE_HANDLE_KILLPRIV_V2 = 1 << 28;
-        /// extended setxattr support
-        const FUSE_SETXATTR_EXT = 1 << 29;
-        /// extended fuse_init_in request
-        const FUSE_INIT_EXT = 1 << 30;
-        /// reserved, do not use
-        const FUSE_INIT_RESERVED = 1 << 31;
-        /// add security context to create/mkdir/symlink/mknod
-        const FUSE_SECURITY_CTX = 1 << 32;
-        /// filesystem supports per-inode DAX
-        const FUSE_HAS_INODE_DAX = 1 << 33;
-        /// create with supplementary group
-        const FUSE_CREATE_SUPP_GROUP = 1 << 34;
-        /// kernel supports expire-only invalidation
-        const FUSE_HAS_EXPIRE_ONLY = 1 << 35;
-        /// allow mmap for direct I/O files
-        const FUSE_DIRECT_IO_ALLOW_MMAP = 1 << 36;
-        /// filesystem wants to use passthrough files
-        const FUSE_PASSTHROUGH = 1 << 37;
-        /// filesystem does not support export
-        const FUSE_NO_EXPORT_SUPPORT = 1 << 38;
-        /// kernel supports resend requests
-        const FUSE_HAS_RESEND = 1 << 39;
-        /// allow idmapped mounts
-        const FUSE_ALLOW_IDMAP = 1 << 40;
-        /// kernel supports io_uring for communication
-        const FUSE_OVER_IO_URING = 1 << 41;
-        /// kernel supports request timeout
-        const FUSE_REQUEST_TIMEOUT = 1 << 42;
-
-        #[cfg(target_os = "macos")]
-        const FUSE_ALLOCATE = 1 << 27;
-        #[cfg(target_os = "macos")]
-        const FUSE_EXCHANGE_DATA = 1 << 28;
-        #[cfg(target_os = "macos")]
-        const FUSE_CASE_INSENSITIVE = 1 << 29;
-        #[cfg(target_os = "macos")]
-        const FUSE_VOL_RENAME = 1 << 30;
-        #[cfg(target_os = "macos")]
-        const FUSE_XTIMES = 1 << 31;
-    }
-}
-
-impl InitFlags {
-    /// Returns the flags as a pair of (low, high) u32 values.
-    /// The low value contains bits 0-31, the high value contains bits 32-63.
-    pub(crate) fn pair(self) -> (u32, u32) {
-        let bits = self.bits();
-        (bits as u32, (bits >> 32) as u32)
-    }
-}
-
 pub mod consts {
-    // CUSE init request/reply flags
-    pub const CUSE_UNRESTRICTED_IOCTL: u32 = 1 << 0; // use unrestricted ioctl
-
-    // Release flags
-    pub const FUSE_RELEASE_FLUSH: u32 = 1 << 0;
-    pub const FUSE_RELEASE_FLOCK_UNLOCK: u32 = 1 << 1;
-
-    // Getattr flags
-    pub const FUSE_GETATTR_FH: u32 = 1 << 0;
-
     // Lock flags
     pub const FUSE_LK_FLOCK: u32 = 1 << 0;
 
     // IOCTL constant
     pub const FUSE_IOCTL_MAX_IOV: u32 = 256; // maximum of in_iovecs + out_iovecs
-
-    // fsync flags
-    pub const FUSE_FSYNC_FDATASYNC: u32 = 1 << 0; // Sync data only, not metadata
 
     // The read buffer is required to be at least 8k, but may be much larger
     pub const FUSE_MIN_READ_BUFFER: usize = 8192;
@@ -399,7 +204,7 @@ pub(crate) struct fuse_forget_in {
 
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
-pub struct fuse_forget_one {
+pub(crate) struct fuse_forget_one {
     pub nodeid: u64,
     pub nlookup: u64,
 }

@@ -22,78 +22,81 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::SystemTime;
 
-use libc::c_int;
-pub use ll::fuse_abi::fuse_forget_one;
 use log::warn;
-pub use mnt::mount_options::MountOption;
-use mnt::mount_options::parse_options_from_args;
-pub use notify::Notifier;
-pub use notify::PollHandle;
-#[cfg(feature = "abi-7-40")]
-pub use passthrough::BackingId;
-pub use reply::ReplyAttr;
-pub use reply::ReplyBmap;
-pub use reply::ReplyCreate;
-pub use reply::ReplyData;
-pub use reply::ReplyDirectory;
-pub use reply::ReplyDirectoryPlus;
-pub use reply::ReplyEmpty;
-pub use reply::ReplyEntry;
-pub use reply::ReplyIoctl;
-pub use reply::ReplyLock;
-pub use reply::ReplyLseek;
-pub use reply::ReplyOpen;
-pub use reply::ReplyPoll;
-pub use reply::ReplyStatfs;
-pub use reply::ReplyWrite;
 #[cfg(target_os = "macos")]
 pub use reply::ReplyXTimes;
-pub use reply::ReplyXattr;
 #[cfg(feature = "serializable")]
 use serde::Deserialize;
 #[cfg(feature = "serializable")]
 use serde::Serialize;
-pub use session::BackgroundSession;
-pub use session::Session;
-pub use session::SessionACL;
-pub use session::SessionUnmounter;
 
 pub use crate::access_flags::AccessFlags;
+pub use crate::bsd_file_flags::BsdFileFlags;
+use crate::forget_one::ForgetOne;
 pub use crate::ll::Errno;
 pub use crate::ll::Generation;
 pub use crate::ll::RequestId;
 pub use crate::ll::TimeOrNow;
-pub use crate::ll::copy_file_range_flags::CopyFileRangeFlags;
-pub use crate::ll::fuse_abi::FopenFlags;
-pub use crate::ll::fuse_abi::InitFlags;
+pub use crate::ll::flags::copy_file_range_flags::CopyFileRangeFlags;
+pub use crate::ll::flags::fopen_flags::FopenFlags;
+pub use crate::ll::flags::init_flags::InitFlags;
+pub use crate::ll::flags::ioctl_flags::IoctlFlags;
+pub use crate::ll::flags::poll_flags::PollFlags;
+pub use crate::ll::flags::read_flags::ReadFlags;
+pub use crate::ll::flags::write_flags::WriteFlags;
 pub use crate::ll::fuse_abi::consts;
-use crate::ll::fuse_abi::consts::*;
-pub use crate::ll::ioctl_flags::IoctlFlags;
-pub use crate::ll::poll_flags::PollFlags;
-pub use crate::ll::read_flags::ReadFlags;
 pub use crate::ll::request::FileHandle;
 pub use crate::ll::request::INodeNo;
 pub use crate::ll::request::LockOwner;
-pub use crate::ll::write_flags::WriteFlags;
+pub use crate::ll::request::Version;
+pub use crate::mnt::mount_options::MountOption;
 use crate::mnt::mount_options::check_option_conflicts;
+use crate::mnt::mount_options::parse_options_from_args;
+pub use crate::notify::Notifier;
+pub use crate::notify::PollHandle;
+pub use crate::notify::PollNotifier;
 pub use crate::open_flags::OpenAccMode;
 pub use crate::open_flags::OpenFlags;
+pub use crate::passthrough::BackingId;
+pub use crate::poll_events::PollEvents;
 pub use crate::rename_flags::RenameFlags;
+pub use crate::reply::ReplyAttr;
+pub use crate::reply::ReplyBmap;
+pub use crate::reply::ReplyCreate;
+pub use crate::reply::ReplyData;
+pub use crate::reply::ReplyDirectory;
+pub use crate::reply::ReplyDirectoryPlus;
+pub use crate::reply::ReplyEmpty;
+pub use crate::reply::ReplyEntry;
+pub use crate::reply::ReplyIoctl;
+pub use crate::reply::ReplyLock;
+pub use crate::reply::ReplyLseek;
+pub use crate::reply::ReplyOpen;
+pub use crate::reply::ReplyPoll;
+pub use crate::reply::ReplyStatfs;
+pub use crate::reply::ReplyWrite;
+pub use crate::reply::ReplyXattr;
 pub use crate::request_param::Request;
+pub use crate::session::BackgroundSession;
 use crate::session::MAX_WRITE_SIZE;
+pub use crate::session::Session;
+pub use crate::session::SessionACL;
+pub use crate::session::SessionUnmounter;
 
 mod access_flags;
+mod bsd_file_flags;
 mod channel;
 mod dev_fuse;
 /// Experimental APIs
 #[cfg(feature = "experimental")]
 pub mod experimental;
+mod forget_one;
 mod ll;
 mod mnt;
 mod notify;
 mod open_flags;
-#[cfg(feature = "abi-7-40")]
 mod passthrough;
+mod poll_events;
 mod rename_flags;
 mod reply;
 mod request;
@@ -114,20 +117,12 @@ const INIT_FLAGS: InitFlags = InitFlags::FUSE_ASYNC_READ
     .union(InitFlags::FUSE_XTIMES);
 // TODO: Add FUSE_EXPORT_SUPPORT and FUSE_BIG_WRITES (requires ABI 7.10)
 
-const fn default_init_flags(#[allow(unused_variables)] capabilities: InitFlags) -> InitFlags {
-    #[cfg(not(feature = "abi-7-28"))]
-    {
-        INIT_FLAGS
+fn default_init_flags(capabilities: InitFlags) -> InitFlags {
+    let mut flags = INIT_FLAGS;
+    if capabilities.contains(InitFlags::FUSE_MAX_PAGES) {
+        flags |= InitFlags::FUSE_MAX_PAGES;
     }
-
-    #[cfg(feature = "abi-7-28")]
-    {
-        let mut flags = INIT_FLAGS;
-        if capabilities.contains(InitFlags::FUSE_MAX_PAGES) {
-            flags = flags.union(InitFlags::FUSE_MAX_PAGES);
-        }
-        flags
-    }
+    flags
 }
 
 /// File types
@@ -222,10 +217,11 @@ pub struct KernelConfig {
     max_write: u32,
     time_gran: Duration,
     max_stack_depth: u32,
+    kernel_abi: Version,
 }
 
 impl KernelConfig {
-    fn new(capabilities: InitFlags, max_readahead: u32) -> Self {
+    fn new(capabilities: InitFlags, max_readahead: u32, kernel_abi: Version) -> Self {
         Self {
             capabilities,
             requested: default_init_flags(capabilities),
@@ -238,6 +234,7 @@ impl KernelConfig {
             // 1ns means nano-second granularity.
             time_gran: Duration::new(0, 1),
             max_stack_depth: 0,
+            kernel_abi,
         }
     }
 
@@ -255,7 +252,6 @@ impl KernelConfig {
     /// On success, returns the previous value.  
     /// # Errors
     /// If argument is too large, returns the nearest value which will succeed.
-    #[cfg(feature = "abi-7-40")]
     pub fn set_max_stack_depth(&mut self, value: u32) -> Result<u32, u32> {
         // https://lore.kernel.org/linux-fsdevel/CAOYeF9V_n93OEF_uf0Gwtd=+da0ReX8N2aaT6RfEJ9DPvs8O2w@mail.gmail.com/
         const FILESYSTEM_MAX_STACK_DEPTH: u32 = 2;
@@ -276,7 +272,6 @@ impl KernelConfig {
     /// On success returns the previous value.  
     /// # Errors
     /// If the argument does not match any valid granularity, returns the nearest value which will succeed.
-    #[cfg(feature = "abi-7-23")]
     pub fn set_time_granularity(&mut self, value: Duration) -> Result<Duration, Duration> {
         if value.as_nanos() == 0 {
             return Err(Duration::new(0, 1));
@@ -329,6 +324,16 @@ impl KernelConfig {
         let previous = self.max_readahead;
         self.max_readahead = value;
         Ok(previous)
+    }
+
+    /// Query kernel capabilities.
+    pub fn capabilities(&self) -> InitFlags {
+        self.capabilities & !InitFlags::FUSE_INIT_EXT
+    }
+
+    /// Kernel ABI version.
+    pub fn kernel_abi(&self) -> Version {
+        self.kernel_abi
     }
 
     /// Add a set of capabilities.
@@ -393,11 +398,11 @@ impl KernelConfig {
 /// implementations are provided here to get a mountable filesystem that does
 /// nothing.
 #[allow(clippy::too_many_arguments)]
-pub trait Filesystem {
+pub trait Filesystem: Send + Sync + 'static {
     /// Initialize filesystem.
     /// Called before any other filesystem method.
     /// The kernel module connection can be configured using the `KernelConfig` object
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> Result<(), c_int> {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
         Ok(())
     }
 
@@ -406,7 +411,7 @@ pub trait Filesystem {
     fn destroy(&mut self) {}
 
     /// Look up a directory entry by name and get its attributes.
-    fn lookup(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         warn!("[Not Implemented] lookup(parent: {parent:#x?}, name {name:?})");
         reply.error(Errno::ENOSYS);
     }
@@ -418,25 +423,25 @@ pub trait Filesystem {
     /// each forget. The filesystem may ignore forget calls, if the inodes don't need to
     /// have a limited lifetime. On unmount it is not guaranteed, that all referenced
     /// inodes will receive a forget message.
-    fn forget(&mut self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
+    fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
 
-    /// Like forget, but take multiple forget requests at once for performance. The default
-    /// implementation will fallback to forget.
-    fn batch_forget(&mut self, req: &Request, nodes: &[fuse_forget_one]) {
+    /// Like [`forget`](Self::forget), but take multiple forget requests at once for performance. The default
+    /// implementation will fallback to `forget`.
+    fn batch_forget(&self, req: &Request, nodes: &[ForgetOne]) {
         for node in nodes {
-            self.forget(req, INodeNo(node.nodeid), node.nlookup);
+            self.forget(req, node.nodeid(), node.nlookup());
         }
     }
 
     /// Get file attributes.
-    fn getattr(&mut self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         warn!("[Not Implemented] getattr(ino: {ino:#x?}, fh: {fh:#x?})");
         reply.error(Errno::ENOSYS);
     }
 
     /// Set file attributes.
     fn setattr(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
@@ -450,7 +455,7 @@ pub trait Filesystem {
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        flags: Option<u32>,
+        flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         warn!(
@@ -461,7 +466,7 @@ pub trait Filesystem {
     }
 
     /// Read symbolic link.
-    fn readlink(&mut self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         warn!("[Not Implemented] readlink(ino: {ino:#x?})");
         reply.error(Errno::ENOSYS);
     }
@@ -469,7 +474,7 @@ pub trait Filesystem {
     /// Create file node.
     /// Create a regular file, character device, block device, fifo or socket node.
     fn mknod(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
@@ -487,7 +492,7 @@ pub trait Filesystem {
 
     /// Create a directory.
     fn mkdir(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
@@ -502,20 +507,20 @@ pub trait Filesystem {
     }
 
     /// Remove a file.
-    fn unlink(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         warn!("[Not Implemented] unlink(parent: {parent:#x?}, name: {name:?})",);
         reply.error(Errno::ENOSYS);
     }
 
     /// Remove a directory.
-    fn rmdir(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         warn!("[Not Implemented] rmdir(parent: {parent:#x?}, name: {name:?})",);
         reply.error(Errno::ENOSYS);
     }
 
     /// Create a symbolic link.
     fn symlink(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
@@ -530,7 +535,7 @@ pub trait Filesystem {
 
     /// Rename a file.
     fn rename(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
@@ -548,7 +553,7 @@ pub trait Filesystem {
 
     /// Create a hard link.
     fn link(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         newparent: INodeNo,
@@ -569,8 +574,8 @@ pub trait Filesystem {
     /// anything in fh. There are also some flags (`direct_io`, `keep_cache`) which the
     /// filesystem may set, to change the way the file is opened. See `fuse_file_info`
     /// structure in <`fuse_common.h`> for more details.
-    fn open(&mut self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        reply.opened(0, FopenFlags::empty());
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     /// Read data.
@@ -584,7 +589,7 @@ pub trait Filesystem {
     /// flags: these are the file flags, such as `O_SYNC`. Only supported with ABI >= 7.9
     /// `lock_owner`: only supported with ABI >= 7.9
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -614,14 +619,14 @@ pub trait Filesystem {
     /// flags: these are the file flags, such as `O_SYNC`. Only supported with ABI >= 7.9
     /// `lock_owner`: only supported with ABI >= 7.9
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: i64,
         data: &[u8],
         write_flags: WriteFlags,
-        flags: i32,
+        flags: OpenFlags,
         lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
@@ -645,7 +650,7 @@ pub trait Filesystem {
     /// filesystem wants to return write errors. If the filesystem supports file locking
     /// operations (`setlk`, `getlk`) it should remove all locks belonging to `lock_owner`.
     fn flush(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -665,11 +670,11 @@ pub trait Filesystem {
     /// if the open method didn't set any value. flags will contain the same flags as for
     /// open.
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
         _ino: INodeNo,
         _fh: FileHandle,
-        _flags: i32,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
@@ -681,7 +686,7 @@ pub trait Filesystem {
     /// If the datasync parameter is non-zero, then only the user data should be flushed,
     /// not the meta data.
     fn fsync(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -699,8 +704,8 @@ pub trait Filesystem {
     /// anything in fh, though that makes it impossible to implement standard conforming
     /// directory stream operations in case the contents of the directory can change
     /// between opendir and releasedir.
-    fn opendir(&mut self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        reply.opened(0, FopenFlags::empty());
+    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     /// Read directory.
@@ -709,7 +714,7 @@ pub trait Filesystem {
     /// value set by the opendir method, or will be undefined if the opendir method
     /// didn't set any value.
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -726,7 +731,7 @@ pub trait Filesystem {
     /// value set by the opendir method, or will be undefined if the opendir method
     /// didn't set any value.
     fn readdirplus(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -742,11 +747,11 @@ pub trait Filesystem {
     /// contain the value set by the opendir method, or will be undefined if the
     /// opendir method didn't set any value.
     fn releasedir(
-        &mut self,
+        &self,
         _req: &Request,
         _ino: INodeNo,
         _fh: FileHandle,
-        _flags: i32,
+        _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
         reply.ok();
@@ -757,7 +762,7 @@ pub trait Filesystem {
     /// be flushed, not the meta data. fh will contain the value set by the opendir
     /// method, or will be undefined if the opendir method didn't set any value.
     fn fsyncdir(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -769,13 +774,13 @@ pub trait Filesystem {
     }
 
     /// Get file system statistics.
-    fn statfs(&mut self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
 
     /// Set an extended attribute.
     fn setxattr(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         name: &OsStr,
@@ -795,14 +800,7 @@ pub trait Filesystem {
     /// If `size` is 0, the size of the value should be sent with `reply.size()`.
     /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
     /// `reply.error(ERANGE)` if it doesn't.
-    fn getxattr(
-        &mut self,
-        _req: &Request,
-        ino: INodeNo,
-        name: &OsStr,
-        size: u32,
-        reply: ReplyXattr,
-    ) {
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         warn!("[Not Implemented] getxattr(ino: {ino:#x?}, name: {name:?}, size: {size})");
         reply.error(Errno::ENOSYS);
     }
@@ -811,13 +809,13 @@ pub trait Filesystem {
     /// If `size` is 0, the size of the value should be sent with `reply.size()`.
     /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
     /// `reply.error(ERANGE)` if it doesn't.
-    fn listxattr(&mut self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         warn!("[Not Implemented] listxattr(ino: {ino:#x?}, size: {size})");
         reply.error(Errno::ENOSYS);
     }
 
     /// Remove an extended attribute.
-    fn removexattr(&mut self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         warn!("[Not Implemented] removexattr(ino: {ino:#x?}, name: {name:?})");
         reply.error(Errno::ENOSYS);
     }
@@ -826,7 +824,7 @@ pub trait Filesystem {
     /// This will be called for the `access()` system call. If the `default_permissions`
     /// mount option is given, this method is not called. This method is not called
     /// under Linux kernel versions 2.4.x
-    fn access(&mut self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+    fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
         warn!("[Not Implemented] access(ino: {ino:#x?}, mask: {mask})");
         reply.error(Errno::ENOSYS);
     }
@@ -842,7 +840,7 @@ pub trait Filesystem {
     /// this method is not implemented or under Linux kernel versions earlier than
     /// 2.6.15, the `mknod()` and `open()` methods will be called instead.
     fn create(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
@@ -860,7 +858,7 @@ pub trait Filesystem {
 
     /// Test for a POSIX file lock.
     fn getlk(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -886,7 +884,7 @@ pub trait Filesystem {
     /// implemented, the kernel will still allow file locking to work locally.
     /// Hence these are only interesting for network filesystems and similar.
     fn setlk(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -908,14 +906,14 @@ pub trait Filesystem {
     /// Map block index within file to block index within device.
     /// Note: This makes sense only for block device backed filesystems mounted
     /// with the 'blkdev' option
-    fn bmap(&mut self, _req: &Request, ino: INodeNo, blocksize: u32, idx: u64, reply: ReplyBmap) {
+    fn bmap(&self, _req: &Request, ino: INodeNo, blocksize: u32, idx: u64, reply: ReplyBmap) {
         warn!("[Not Implemented] bmap(ino: {ino:#x?}, blocksize: {blocksize}, idx: {idx})",);
         reply.error(Errno::ENOSYS);
     }
 
     /// control device
     fn ioctl(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -935,12 +933,12 @@ pub trait Filesystem {
 
     /// Poll for events
     fn poll(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
-        ph: PollHandle,
-        events: u32,
+        ph: PollNotifier,
+        events: PollEvents,
         flags: PollFlags,
         reply: ReplyPoll,
     ) {
@@ -953,7 +951,7 @@ pub trait Filesystem {
 
     /// Preallocate or deallocate space to a file
     fn fallocate(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -971,7 +969,7 @@ pub trait Filesystem {
 
     /// Reposition read/write file offset
     fn lseek(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -988,7 +986,7 @@ pub trait Filesystem {
 
     /// Copy the specified range from the source inode to the destination inode
     fn copy_file_range(
-        &mut self,
+        &self,
         _req: &Request,
         ino_in: INodeNo,
         fh_in: FileHandle,
@@ -1011,7 +1009,7 @@ pub trait Filesystem {
     /// macOS only: Rename the volume. Set `fuse_init_out.flags` during init to
     /// `FUSE_VOL_RENAME` to enable
     #[cfg(target_os = "macos")]
-    fn setvolname(&mut self, _req: &Request, name: &OsStr, reply: ReplyEmpty) {
+    fn setvolname(&self, _req: &Request, name: &OsStr, reply: ReplyEmpty) {
         warn!("[Not Implemented] setvolname(name: {name:?})");
         reply.error(Errno::ENOSYS);
     }
@@ -1019,7 +1017,7 @@ pub trait Filesystem {
     /// macOS only (undocumented)
     #[cfg(target_os = "macos")]
     fn exchange(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
@@ -1038,7 +1036,7 @@ pub trait Filesystem {
     /// macOS only: Query extended times (`bkuptime` and `crtime`). Set `fuse_init_out.flags`
     /// during init to `FUSE_XTIMES` to enable
     #[cfg(target_os = "macos")]
-    fn getxtimes(&mut self, _req: &Request, ino: INodeNo, reply: ReplyXTimes) {
+    fn getxtimes(&self, _req: &Request, ino: INodeNo, reply: ReplyXTimes) {
         warn!("[Not Implemented] getxtimes(ino: {ino:#x?})");
         reply.error(Errno::ENOSYS);
     }
@@ -1074,7 +1072,7 @@ pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
     options: &[MountOption],
 ) -> io::Result<()> {
     check_option_conflicts(options)?;
-    Session::new(filesystem, mountpoint.as_ref(), options).and_then(|mut se| se.run())
+    Session::new(filesystem, mountpoint.as_ref(), options).and_then(|se| se.run())
 }
 
 /// Mount the given filesystem to the given mountpoint. This function spawns

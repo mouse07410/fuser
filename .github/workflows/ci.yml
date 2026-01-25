@@ -17,6 +17,7 @@ jobs:
 
     env:
       RUSTFLAGS: --deny warnings
+      RUSTDOCFLAGS: --deny warnings
 
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +60,7 @@ jobs:
     timeout-minutes: 10
     env:
       RUSTFLAGS: --deny warnings
+      RUSTDOCFLAGS: --deny warnings
     steps:
       - uses: actions/checkout@v4
 
@@ -92,6 +94,54 @@ jobs:
         run: cargo install --force --version 0.16.2 cargo-deny --locked
 
       - name: Run tests
+        run: INTERACTIVE="" make pre
+
+  mac-ci:
+    runs-on: macos-26
+    env:
+      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache
+        id: rust-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.rustup/toolchains/
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-compile-v1-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml') }}
+
+      - name: Install packages
+        run: |
+          brew update > /dev/null && brew install autoconf automake
+          brew install --cask macfuse
+
+      - name: Install Rust
+        run: |
+          rustup component add --toolchain nightly rustfmt
+          rustup component add clippy
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-deny
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo install --force --version 0.16.2 cargo-deny --locked
+
+      - name: Build
+        run: |
+          cargo check --features=internal-no-mount
+          cargo build --all --all-targets
+          cargo build --all --all-targets --all-features
+
+      - name: Docs
+        run: cargo doc --all --no-deps --all-features
+
+      - name: Lint
         run: INTERACTIVE="" make pre
 
   test:

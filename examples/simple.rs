@@ -3,7 +3,6 @@
 
 use std::cmp::min;
 use std::collections::BTreeMap;
-use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
@@ -16,7 +15,6 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
-use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
@@ -29,11 +27,9 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use clap::Arg;
-use clap::ArgAction;
-use clap::Command;
-use clap::crate_version;
+use clap::Parser;
 use fuser::AccessFlags;
+use fuser::BsdFileFlags;
 use fuser::Errno;
 use fuser::FileHandle;
 use fuser::Filesystem;
@@ -59,18 +55,47 @@ use fuser::ReplyWrite;
 use fuser::ReplyXattr;
 use fuser::Request;
 use fuser::TimeOrNow;
-// #[cfg(feature = "abi-7-31")]
-// use fuser::consts::FUSE_WRITE_KILL_PRIV;
 use fuser::TimeOrNow::Now;
 use fuser::WriteFlags;
 use log::LevelFilter;
 use log::debug;
 use log::error;
-#[cfg(feature = "abi-7-26")]
 use log::info;
 use log::warn;
 use serde::Deserialize;
 use serde::Serialize;
+
+#[derive(Parser)]
+#[command(version, author = "Christopher Berner")]
+struct Args {
+    /// Set local directory used to store data
+    #[clap(long, default_value = "/tmp/fuser")]
+    data_dir: String,
+
+    /// Act as a client, and mount FUSE at given path
+    #[clap(long, default_value = "")]
+    mount_point: String,
+
+    /// Mount FUSE with direct IO
+    #[clap(long, requires = "mount_point")]
+    direct_io: bool,
+
+    /// Automatically unmount FUSE when process exits
+    #[clap(long)]
+    auto_unmount: bool,
+
+    /// Run a filesystem check
+    #[clap(long)]
+    fsck: bool,
+
+    /// Enable setuid support when run as root
+    #[clap(long)]
+    suid: bool,
+
+    /// Sets the level of verbosity
+    #[clap(short, action = clap::ArgAction::Count)]
+    v: u8,
+}
 
 const BLOCK_SIZE: u32 = 512;
 const MAX_NAME_LENGTH: u32 = 255;
@@ -288,28 +313,12 @@ struct SimpleFS {
 }
 
 impl SimpleFS {
-    fn new(
-        data_dir: String,
-        direct_io: bool,
-        #[allow(unused_variables)] suid_support: bool,
-    ) -> SimpleFS {
-        #[cfg(feature = "abi-7-26")]
-        {
-            SimpleFS {
-                data_dir,
-                next_file_handle: AtomicU64::new(1),
-                direct_io,
-                suid_support,
-            }
-        }
-        #[cfg(not(feature = "abi-7-26"))]
-        {
-            SimpleFS {
-                data_dir,
-                next_file_handle: AtomicU64::new(1),
-                direct_io,
-                suid_support: false,
-            }
+    fn new(data_dir: String, direct_io: bool, suid_support: bool) -> SimpleFS {
+        SimpleFS {
+            data_dir,
+            next_file_handle: AtomicU64::new(1),
+            direct_io,
+            suid_support,
         }
     }
 
@@ -521,11 +530,13 @@ impl Filesystem for SimpleFS {
         &mut self,
         _req: &Request,
         #[allow(unused_variables)] config: &mut KernelConfig,
-    ) -> Result<(), c_int> {
-        if cfg!(feature = "abi-7-26") {
-            config
-                .add_capabilities(InitFlags::FUSE_HANDLE_KILLPRIV)
-                .unwrap();
+    ) -> io::Result<()> {
+        if config
+            .add_capabilities(InitFlags::FUSE_HANDLE_KILLPRIV)
+            .is_err()
+        {
+            info!("FUSE_HANDLE_KILLPRIV not supported");
+            self.suid_support = false;
         }
 
         fs::create_dir_all(Path::new(&self.data_dir).join("inodes")).unwrap();
@@ -554,7 +565,7 @@ impl Filesystem for SimpleFS {
         Ok(())
     }
 
-    fn lookup(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if name.len() > MAX_NAME_LENGTH as usize {
             reply.error(Errno::ENAMETOOLONG);
             return;
@@ -578,9 +589,9 @@ impl Filesystem for SimpleFS {
         }
     }
 
-    fn forget(&mut self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
+    fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
 
-    fn getattr(&mut self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.get_inode(ino) {
             Ok(attrs) => reply.attr(&Duration::new(0, 0), &attrs.into()),
             Err(error_code) => reply.error(error_code),
@@ -588,7 +599,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn setattr(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
@@ -602,7 +613,7 @@ impl Filesystem for SimpleFS {
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         let mut attrs = match self.get_inode(ino) {
@@ -780,7 +791,7 @@ impl Filesystem for SimpleFS {
         return;
     }
 
-    fn readlink(&mut self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         debug!("readlink() called on {ino:?}");
         let path = self.content_path(ino);
         match File::open(path) {
@@ -797,7 +808,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn mknod(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
@@ -899,7 +910,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn mkdir(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
@@ -972,7 +983,7 @@ impl Filesystem for SimpleFS {
         reply.entry(&Duration::new(0, 0), &attrs.into(), fuser::Generation(0));
     }
 
-    fn unlink(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         debug!("unlink() called with {parent:?} {name:?}");
         let mut attrs = match self.lookup_name(parent, name) {
             Ok(attrs) => attrs,
@@ -1029,7 +1040,7 @@ impl Filesystem for SimpleFS {
         reply.ok();
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         debug!("rmdir() called with {parent:?} {name:?}");
         let mut attrs = match self.lookup_name(parent, name) {
             Ok(attrs) => attrs,
@@ -1096,7 +1107,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn symlink(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
@@ -1163,7 +1174,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn rename(
-        &mut self,
+        &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
@@ -1380,7 +1391,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn link(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         newparent: INodeNo,
@@ -1405,7 +1416,7 @@ impl Filesystem for SimpleFS {
         }
     }
 
-    fn open(&mut self, _req: &Request, _ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, _ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         debug!("open() called for {_ino:?}");
         let (access_mask, read, write) = match flags.acc_mode() {
             OpenAccMode::O_RDONLY => {
@@ -1442,7 +1453,10 @@ impl Filesystem for SimpleFS {
                     } else {
                         FopenFlags::empty()
                     };
-                    reply.opened(self.allocate_next_file_handle(read, write), open_flags);
+                    reply.opened(
+                        FileHandle(self.allocate_next_file_handle(read, write)),
+                        open_flags,
+                    );
                 } else {
                     reply.error(Errno::EACCES);
                 }
@@ -1453,7 +1467,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -1487,14 +1501,14 @@ impl Filesystem for SimpleFS {
     }
 
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: i64,
         data: &[u8],
         _write_flags: WriteFlags,
-        _flags: i32,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
@@ -1517,7 +1531,6 @@ impl Filesystem for SimpleFS {
                 if data.len() + offset as usize > attrs.size as usize {
                     attrs.size = (data.len() + offset as usize) as u64;
                 }
-                // #[cfg(feature = "abi-7-31")]
                 // if flags & FUSE_WRITE_KILL_PRIV as i32 != 0 {
                 //     clear_suid_sgid(&mut attrs);
                 // }
@@ -1535,11 +1548,11 @@ impl Filesystem for SimpleFS {
     }
 
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
         _ino: INodeNo,
         _fh: FileHandle,
-        _flags: i32,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
@@ -1550,7 +1563,7 @@ impl Filesystem for SimpleFS {
         reply.ok();
     }
 
-    fn opendir(&mut self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         debug!("opendir() called on {_ino:?}");
         let (access_mask, read, write) = match _flags.acc_mode() {
             OpenAccMode::O_RDONLY => {
@@ -1582,7 +1595,10 @@ impl Filesystem for SimpleFS {
                     } else {
                         FopenFlags::empty()
                     };
-                    reply.opened(self.allocate_next_file_handle(read, write), open_flags);
+                    reply.opened(
+                        FileHandle(self.allocate_next_file_handle(read, write)),
+                        open_flags,
+                    );
                 } else {
                     reply.error(Errno::EACCES);
                 }
@@ -1593,7 +1609,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
@@ -1628,11 +1644,11 @@ impl Filesystem for SimpleFS {
     }
 
     fn releasedir(
-        &mut self,
+        &self,
         _req: &Request,
         _ino: INodeNo,
         _fh: FileHandle,
-        _flags: i32,
+        _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
         if let Ok(mut attrs) = self.get_inode(_ino) {
@@ -1641,7 +1657,7 @@ impl Filesystem for SimpleFS {
         reply.ok();
     }
 
-    fn statfs(&mut self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         warn!("statfs() implementation is a stub");
         // TODO: real implementation of this
         reply.statfs(
@@ -1657,7 +1673,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn setxattr(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         name: &OsStr,
@@ -1684,7 +1700,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn getxattr(
-        &mut self,
+        &self,
         request: &Request,
         inode: INodeNo,
         key: &OsStr,
@@ -1716,7 +1732,7 @@ impl Filesystem for SimpleFS {
         }
     }
 
-    fn listxattr(&mut self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         if let Ok(attrs) = self.get_inode(ino) {
             let mut bytes = vec![];
             // Convert to concatenated null-terminated strings
@@ -1736,7 +1752,7 @@ impl Filesystem for SimpleFS {
         }
     }
 
-    fn removexattr(&mut self, request: &Request, inode: INodeNo, key: &OsStr, reply: ReplyEmpty) {
+    fn removexattr(&self, request: &Request, inode: INodeNo, key: &OsStr, reply: ReplyEmpty) {
         if let Ok(mut attrs) = self.get_inode(inode) {
             if let Err(error) = xattr_access_check(key.as_bytes(), libc::W_OK, &attrs, request) {
                 reply.error(error);
@@ -1758,7 +1774,7 @@ impl Filesystem for SimpleFS {
         }
     }
 
-    fn access(&mut self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+    fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
         debug!("access() called with {ino:?} {mask:?}");
         match self.get_inode(ino) {
             Ok(attr) => {
@@ -1773,7 +1789,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn create(
-        &mut self,
+        &self,
         req: &Request,
         parent: INodeNo,
         name: &OsStr,
@@ -1873,14 +1889,14 @@ impl Filesystem for SimpleFS {
             &Duration::new(0, 0),
             &attrs.into(),
             fuser::Generation(0),
-            self.allocate_next_file_handle(read, write),
+            FileHandle(self.allocate_next_file_handle(read, write)),
             0,
         );
     }
 
     #[cfg(target_os = "linux")]
     fn fallocate(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
@@ -1913,7 +1929,7 @@ impl Filesystem for SimpleFS {
     }
 
     fn copy_file_range(
-        &mut self,
+        &self,
         _req: &Request,
         src_inode: INodeNo,
         src_fh: FileHandle,
@@ -2127,58 +2143,9 @@ fn fuse_allow_other_enabled() -> io::Result<bool> {
 }
 
 fn main() {
-    let matches = Command::new("Fuser")
-        .version(crate_version!())
-        .author("Christopher Berner")
-        .arg(
-            Arg::new("data-dir")
-                .long("data-dir")
-                .value_name("DIR")
-                .default_value("/tmp/fuser")
-                .help("Set local directory used to store data"),
-        )
-        .arg(
-            Arg::new("mount-point")
-                .long("mount-point")
-                .value_name("MOUNT_POINT")
-                .default_value("")
-                .help("Act as a client, and mount FUSE at given path"),
-        )
-        .arg(
-            Arg::new("direct-io")
-                .long("direct-io")
-                .action(ArgAction::SetTrue)
-                .requires("mount-point")
-                .help("Mount FUSE with direct IO"),
-        )
-        .arg(
-            Arg::new("auto-unmount")
-                .long("auto-unmount")
-                .action(ArgAction::SetTrue)
-                .help("Automatically unmount FUSE when process exits"),
-        )
-        .arg(
-            Arg::new("fsck")
-                .long("fsck")
-                .action(ArgAction::SetTrue)
-                .help("Run a filesystem check"),
-        )
-        .arg(
-            Arg::new("suid")
-                .long("suid")
-                .action(ArgAction::SetTrue)
-                .help("Enable setuid support when run as root"),
-        )
-        .arg(
-            Arg::new("v")
-                .short('v')
-                .action(ArgAction::Count)
-                .help("Sets the level of verbosity"),
-        )
-        .get_matches();
+    let args = Args::parse();
 
-    let verbosity = matches.get_count("v");
-    let log_level = match verbosity {
+    let log_level = match args.v {
         0 => LevelFilter::Error,
         1 => LevelFilter::Warn,
         2 => LevelFilter::Info,
@@ -2192,14 +2159,11 @@ fn main() {
 
     let mut options = vec![MountOption::FSName("fuser".to_string())];
 
-    #[cfg(feature = "abi-7-26")]
-    {
-        if matches.get_flag("suid") {
-            info!("setuid bit support enabled");
-            options.push(MountOption::Suid);
-        }
+    if args.suid {
+        info!("setuid bit support enabled");
+        options.push(MountOption::Suid);
     }
-    if matches.get_flag("auto-unmount") {
+    if args.auto_unmount {
         options.push(MountOption::AutoUnmount);
     }
     if let Ok(enabled) = fuse_allow_other_enabled() {
@@ -2209,21 +2173,13 @@ fn main() {
     } else {
         eprintln!("Unable to read /etc/fuse.conf");
     }
-
-    let data_dir = matches.get_one::<String>("data-dir").unwrap().to_string();
-
-    let mountpoint: String = matches
-        .get_one::<String>("mount-point")
-        .unwrap()
-        .to_string();
+    if options.contains(&MountOption::AutoUnmount) && !options.contains(&MountOption::AllowRoot) {
+        options.push(MountOption::AllowOther);
+    }
 
     let result = fuser::mount2(
-        SimpleFS::new(
-            data_dir,
-            matches.get_flag("direct-io"),
-            matches.get_flag("suid"),
-        ),
-        mountpoint,
+        SimpleFS::new(args.data_dir, args.direct_io, args.suid),
+        &args.mount_point,
         &options,
     );
     if let Err(e) = result {

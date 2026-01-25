@@ -9,7 +9,6 @@
 use std::convert::AsRef;
 use std::ffi::OsStr;
 use std::io::IoSlice;
-#[cfg(feature = "abi-7-40")]
 use std::os::fd::BorrowedFd;
 use std::time::Duration;
 #[cfg(target_os = "macos")]
@@ -21,17 +20,17 @@ use log::warn;
 use crate::Errno;
 use crate::FileAttr;
 use crate::FileType;
+use crate::PollEvents;
 use crate::channel::ChannelSender;
 use crate::ll::Generation;
 use crate::ll::INodeNo;
-use crate::ll::fuse_abi::FopenFlags;
+use crate::ll::flags::fopen_flags::FopenFlags;
 use crate::ll::reply::DirEntList;
 use crate::ll::reply::DirEntOffset;
 use crate::ll::reply::DirEntPlusList;
 use crate::ll::reply::DirEntry;
 use crate::ll::reply::DirEntryPlus;
 use crate::ll::{self};
-#[cfg(feature = "abi-7-40")]
 use crate::passthrough::BackingId;
 
 /// Generic reply callback to send data
@@ -60,7 +59,6 @@ impl ReplySender {
     }
 
     /// Open a backing file
-    #[cfg(feature = "abi-7-40")]
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
         match self {
             ReplySender::Channel(sender) => sender.open_backing(fd),
@@ -321,31 +319,27 @@ impl ReplyOpen {
     /// # Panics
     /// When attempting to use kernel passthrough.
     /// Use [`opened_passthrough()`](Self::opened_passthrough) instead.
-    pub fn opened(self, fh: u64, flags: FopenFlags) {
+    pub fn opened(self, fh: ll::FileHandle, flags: FopenFlags) {
         assert!(!flags.contains(FopenFlags::FOPEN_PASSTHROUGH));
-        self.reply
-            .send_ll(&ll::Response::new_open(ll::FileHandle(fh), flags, 0));
+        self.reply.send_ll(&ll::Response::new_open(fh, flags, 0));
     }
 
     /// Registers a fd for passthrough, returning a `BackingId`.  Once you have the backing ID,
     /// you can pass it as the 3rd parameter of [`ReplyOpen::opened_passthrough()`]. This is done in
     /// two separate steps because it may make sense to reuse backing IDs (to avoid having to
     /// repeatedly reopen the underlying file or potentially keep thousands of fds open).
-    #[cfg(feature = "abi-7-40")]
     pub fn open_backing(&self, fd: impl std::os::fd::AsFd) -> std::io::Result<BackingId> {
+        // TODO: assert passthrough capability is enabled.
         self.reply.sender.as_ref().unwrap().open_backing(fd.as_fd())
     }
 
     /// Reply to a request with an opened backing id. Call [`ReplyOpen::open_backing()`]
     /// to get one of these.
-    #[cfg(feature = "abi-7-40")]
-    pub fn opened_passthrough(self, fh: u64, flags: u32, backing_id: &BackingId) {
-        let flags = FopenFlags::from_bits_retain(flags) | FopenFlags::FOPEN_PASSTHROUGH;
-        self.reply.send_ll(&ll::Response::new_open(
-            ll::FileHandle(fh),
-            flags,
-            backing_id.backing_id,
-        ));
+    pub fn opened_passthrough(self, fh: ll::FileHandle, flags: FopenFlags, backing_id: &BackingId) {
+        // TODO: assert passthrough capability is enabled.
+        let flags = flags | FopenFlags::FOPEN_PASSTHROUGH;
+        self.reply
+            .send_ll(&ll::Response::new_open(fh, flags, backing_id.backing_id));
     }
 
     /// Reply to a request with the given error code
@@ -448,7 +442,7 @@ impl ReplyCreate {
         ttl: &Duration,
         attr: &FileAttr,
         generation: Generation,
-        fh: u64,
+        fh: ll::FileHandle,
         flags: u32,
     ) {
         let flags = FopenFlags::from_bits_retain(flags);
@@ -457,7 +451,7 @@ impl ReplyCreate {
             ttl,
             &attr.into(),
             generation,
-            ll::FileHandle(fh),
+            fh,
             flags,
             0,
         ));
@@ -576,7 +570,7 @@ impl Reply for ReplyPoll {
 
 impl ReplyPoll {
     /// Reply to a request with ready poll events
-    pub fn poll(self, revents: u32) {
+    pub fn poll(self, revents: PollEvents) {
         self.reply.send_ll(&ll::Response::new_poll(revents));
     }
 
@@ -983,7 +977,7 @@ mod test {
             ],
         });
         let reply: ReplyOpen = Reply::new(ll::RequestId(0xdeadbeef), sender);
-        reply.opened(0x1122, FopenFlags::from_bits_retain(0x33));
+        reply.opened(ll::FileHandle(0x1122), FopenFlags::from_bits_retain(0x33));
     }
 
     #[test]
@@ -1076,7 +1070,13 @@ mod test {
             flags: 0x99,
             blksize: 0xdd,
         };
-        reply.created(&ttl, &attr, ll::Generation(0xaa), 0xbb, 0x0c);
+        reply.created(
+            &ttl,
+            &attr,
+            ll::Generation(0xaa),
+            ll::FileHandle(0xbb),
+            0x0c,
+        );
     }
 
     #[test]

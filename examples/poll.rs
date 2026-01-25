@@ -10,6 +10,7 @@
 use std::convert::TryInto;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -18,7 +19,15 @@ use std::thread;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
+use clap::Parser;
 use fuser::Errno;
+
+#[derive(Parser)]
+#[command(version, author = "Zev Weiss")]
+struct Args {
+    /// Act as a client, and mount FUSE at given path
+    mount_point: PathBuf,
+}
 use fuser::FileAttr;
 use fuser::FileHandle;
 use fuser::FileType;
@@ -28,8 +37,10 @@ use fuser::LockOwner;
 use fuser::MountOption;
 use fuser::OpenAccMode;
 use fuser::OpenFlags;
+use fuser::PollEvents;
 use fuser::PollFlags;
 use fuser::PollHandle;
+use fuser::PollNotifier;
 use fuser::ReadFlags;
 use fuser::ReplyAttr;
 use fuser::ReplyData;
@@ -45,8 +56,7 @@ const MAXBYTES: u64 = 10;
 struct FSelData {
     bytecnt: [u64; NUMFILES as usize],
     open_mask: u16,
-    notify_mask: u16,
-    poll_handles: [u64; NUMFILES as usize],
+    poll_handles: [Option<PollHandle>; NUMFILES as usize],
 }
 
 struct FSelFS {
@@ -94,7 +104,7 @@ impl FSelFS {
 }
 
 impl fuser::Filesystem for FSelFS {
-    fn lookup(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent != INodeNo::ROOT || name.len() != 1 {
             reply.error(Errno::ENOENT);
             return;
@@ -118,7 +128,7 @@ impl fuser::Filesystem for FSelFS {
         );
     }
 
-    fn getattr(&mut self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino == INodeNo::ROOT {
             let a = FileAttr {
                 ino: INodeNo::ROOT,
@@ -149,7 +159,7 @@ impl fuser::Filesystem for FSelFS {
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
@@ -186,7 +196,7 @@ impl fuser::Filesystem for FSelFS {
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let idx = FSelData::ino_to_idx(ino);
         if idx >= NUMFILES {
             reply.error(Errno::ENOENT);
@@ -210,17 +220,17 @@ impl fuser::Filesystem for FSelFS {
         }
 
         reply.opened(
-            idx.into(),
+            FileHandle(idx.into()),
             FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_NONSEEKABLE,
         );
     }
 
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
         _ino: INodeNo,
         _fh: FileHandle,
-        _flags: i32,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
@@ -235,7 +245,7 @@ impl fuser::Filesystem for FSelFS {
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
@@ -268,12 +278,12 @@ impl fuser::Filesystem for FSelFS {
     }
 
     fn poll(
-        &mut self,
+        &self,
         _req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
-        ph: PollHandle,
-        _events: u32,
+        ph: PollNotifier,
+        _events: PollEvents,
         flags: PollFlags,
         reply: fuser::ReplyPoll,
     ) {
@@ -292,8 +302,7 @@ impl fuser::Filesystem for FSelFS {
             let mut d = self.get_data();
 
             if flags.contains(PollFlags::FUSE_POLL_SCHEDULE_NOTIFY) {
-                d.notify_mask |= 1 << idx;
-                d.poll_handles[idx as usize] = ph.into();
+                d.poll_handles[idx as usize] = Some(ph.handle());
             }
 
             let nbytes = d.bytecnt[idx as usize];
@@ -304,10 +313,10 @@ impl fuser::Filesystem for FSelFS {
                     nbytes,
                     POLLED_ZERO.swap(0, SeqCst)
                 );
-                libc::POLLIN.try_into().unwrap()
+                PollEvents::POLLIN
             } else {
                 POLLED_ZERO.fetch_add(1, SeqCst);
-                0
+                PollEvents::empty()
             }
         };
 
@@ -327,12 +336,12 @@ fn producer(data: &Mutex<FSelData>, notifier: &fuser::Notifier) {
                 let tidx = t as usize;
                 if d.bytecnt[tidx] != MAXBYTES {
                     d.bytecnt[tidx] += 1;
-                    if d.notify_mask & (1 << t) != 0 {
-                        println!("NOTIFY {t:X}");
-                        if let Err(e) = notifier.poll(d.poll_handles[tidx]) {
-                            eprintln!("poll notification failed: {e}");
-                        }
-                        d.notify_mask &= !(1 << t);
+                    let Some(handle) = d.poll_handles[tidx].take() else {
+                        continue;
+                    };
+                    println!("NOTIFY {t:X}");
+                    if let Err(e) = notifier.poll(handle) {
+                        eprintln!("poll notification failed: {e}");
                     }
                 }
 
@@ -349,17 +358,17 @@ fn producer(data: &Mutex<FSelData>, notifier: &fuser::Notifier) {
 }
 
 fn main() {
+    let args = Args::parse();
+
     let options = vec![MountOption::RO, MountOption::FSName("fsel".to_string())];
     let data = Arc::new(Mutex::new(FSelData {
         bytecnt: [0; NUMFILES as usize],
         open_mask: 0,
-        notify_mask: 0,
-        poll_handles: [0; NUMFILES as usize],
+        poll_handles: [None; NUMFILES as usize],
     }));
     let fs = FSelFS { data: data.clone() };
 
-    let mntpt = std::env::args().nth(1).unwrap();
-    let session = fuser::Session::new(fs, mntpt, &options).unwrap();
+    let session = fuser::Session::new(fs, &args.mount_point, &options).unwrap();
     let bg = session.spawn().unwrap();
 
     producer(&data, &bg.notifier());

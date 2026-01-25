@@ -37,12 +37,12 @@ use fuser::ReplyEntry;
 use fuser::ReplyOpen;
 use fuser::Request;
 
-struct ClockFS<'a> {
+struct ClockFS {
     file_contents: Arc<Mutex<String>>,
-    lookup_cnt: &'a AtomicU64,
+    lookup_cnt: &'static AtomicU64,
 }
 
-impl ClockFS<'_> {
+impl ClockFS {
     const FILE_INO: u64 = 2;
     const FILE_NAME: &'static str = "current_time";
 
@@ -77,8 +77,8 @@ impl ClockFS<'_> {
     }
 }
 
-impl Filesystem for ClockFS<'_> {
-    fn lookup(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+impl Filesystem for ClockFS {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent != INodeNo::ROOT || name != AsRef::<OsStr>::as_ref(&Self::FILE_NAME) {
             reply.error(Errno::ENOENT);
             return;
@@ -92,7 +92,7 @@ impl Filesystem for ClockFS<'_> {
         );
     }
 
-    fn forget(&mut self, _req: &Request, ino: INodeNo, _nlookup: u64) {
+    fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
         if ino == INodeNo(ClockFS::FILE_INO) {
             let prev = self.lookup_cnt.fetch_sub(_nlookup, SeqCst);
             assert!(prev >= _nlookup);
@@ -101,7 +101,7 @@ impl Filesystem for ClockFS<'_> {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.stat(ino) {
             Some(a) => reply.attr(&Duration::MAX, &a),
             None => reply.error(Errno::ENOENT),
@@ -109,7 +109,7 @@ impl Filesystem for ClockFS<'_> {
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
@@ -135,7 +135,7 @@ impl Filesystem for ClockFS<'_> {
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         if ino == INodeNo::ROOT {
             reply.error(Errno::EISDIR);
         } else if flags.acc_mode() != OpenAccMode::O_RDONLY {
@@ -145,12 +145,12 @@ impl Filesystem for ClockFS<'_> {
             reply.error(Errno::ENOENT);
         } else {
             // TODO: we are supposed to pass file handle here, not ino.
-            reply.opened(ino.0, FopenFlags::FOPEN_KEEP_CACHE);
+            reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_KEEP_CACHE);
         }
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
@@ -222,14 +222,18 @@ fn main() {
         drop(s);
         if !opts.no_notify && lookup_cnt.load(SeqCst) != 0 {
             if opts.notify_store {
-                if let Err(e) =
-                    notifier.store(ClockFS::FILE_INO, 0, fdata.lock().unwrap().as_bytes())
-                {
+                if let Err(e) = notifier.store(
+                    INodeNo(ClockFS::FILE_INO),
+                    0,
+                    fdata.lock().unwrap().as_bytes(),
+                ) {
                     eprintln!("Warning: failed to update kernel cache: {e}");
                 }
-            } else if let Err(e) =
-                notifier.inval_inode(ClockFS::FILE_INO, 0, olddata.len().try_into().unwrap())
-            {
+            } else if let Err(e) = notifier.inval_inode(
+                INodeNo(ClockFS::FILE_INO),
+                0,
+                olddata.len().try_into().unwrap(),
+            ) {
                 eprintln!("Warning: failed to invalidate inode: {e}");
             }
         }

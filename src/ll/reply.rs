@@ -17,16 +17,17 @@ use super::Generation;
 use super::INodeNo;
 use super::Lock;
 use super::RequestId;
+use super::flags::fopen_flags::FopenFlags;
 use super::fuse_abi as abi;
-use super::fuse_abi::FopenFlags;
 use crate::FileType;
+use crate::PollEvents;
 
 const INLINE_DATA_THRESHOLD: usize = size_of::<u64>() * 4;
 pub(crate) type ResponseBuf = SmallVec<[u8; INLINE_DATA_THRESHOLD]>;
 
 #[derive(Debug)]
 pub(crate) enum Response<'a> {
-    Error(i32),
+    Error(Option<Errno>),
     Data(ResponseBuf),
     Slice(&'a [u8]),
 }
@@ -44,8 +45,8 @@ impl<'a> Response<'a> {
         };
         let header = abi::fuse_out_header {
             unique: unique.0,
-            error: if let Response::Error(errno) = self {
-                -errno
+            error: if let Response::Error(Some(errno)) = self {
+                -errno.0.get()
             } else {
                 0
             },
@@ -64,11 +65,11 @@ impl<'a> Response<'a> {
 
     // Constructors
     pub(crate) fn new_empty() -> Self {
-        Self::Error(0)
+        Self::Error(None)
     }
 
     pub(crate) fn new_error(error: Errno) -> Self {
-        Self::Error(error.into())
+        Self::Error(Some(error))
     }
 
     pub(crate) fn new_data<T: AsRef<[u8]> + Into<Vec<u8>>>(data: T) -> Self {
@@ -232,9 +233,9 @@ impl<'a> Response<'a> {
         Self::Data(v)
     }
 
-    pub(crate) fn new_poll(revents: u32) -> Self {
+    pub(crate) fn new_poll(revents: PollEvents) -> Self {
         let r = abi::fuse_poll_out {
-            revents,
+            revents: revents.bits(),
             padding: 0,
         };
         Self::from_struct(&r)

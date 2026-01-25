@@ -1,6 +1,7 @@
 #![allow(missing_docs, missing_debug_implementations)]
 
 use std::ffi::OsStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::Errno;
@@ -123,15 +124,15 @@ impl GetAttrResponse {
 /// Adapter to allow running an [`AsyncFilesystem`] with tokio's runtime.
 #[derive(Debug)]
 pub struct TokioAdapter<T: AsyncFilesystem> {
-    inner: T,
+    inner: Arc<T>,
     runtime: tokio::runtime::Runtime,
 }
 
 impl<T: AsyncFilesystem> TokioAdapter<T> {
     pub fn new(inner: T) -> Self {
         Self {
-            inner,
-            runtime: tokio::runtime::Builder::new_current_thread()
+            inner: Arc::new(inner),
+            runtime: tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap(),
@@ -139,33 +140,36 @@ impl<T: AsyncFilesystem> TokioAdapter<T> {
     }
 }
 
-impl<T: AsyncFilesystem> Filesystem for TokioAdapter<T> {
-    fn lookup(&mut self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self
-            .runtime
-            .block_on(self.inner.lookup(&req.into(), parent, name))
-        {
-            Ok(LookupResponse {
-                ttl,
-                attr,
-                generation,
-            }) => reply.entry(&ttl, &attr, generation),
-            Err(e) => reply.error(e),
-        }
+impl<T: AsyncFilesystem + Send + Sync + 'static> Filesystem for TokioAdapter<T> {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let context: RequestContext = req.into();
+        let name = name.to_os_string();
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            match inner.lookup(&context, parent, &name).await {
+                Ok(LookupResponse {
+                    ttl,
+                    attr,
+                    generation,
+                }) => reply.entry(&ttl, &attr, generation),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 
-    fn getattr(&mut self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self
-            .runtime
-            .block_on(self.inner.getattr(&req.into(), ino, fh))
-        {
-            Ok(GetAttrResponse { ttl, attr }) => reply.attr(&ttl, &attr),
-            Err(e) => reply.error(e),
-        }
+    fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        let context: RequestContext = req.into();
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            match inner.getattr(&context, ino, fh).await {
+                Ok(GetAttrResponse { ttl, attr }) => reply.attr(&ttl, &attr),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 
     fn read(
-        &mut self,
+        &self,
         req: &Request,
         ino: INodeNo,
         fh: FileHandle,
@@ -175,46 +179,45 @@ impl<T: AsyncFilesystem> Filesystem for TokioAdapter<T> {
         lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let mut buf = vec![];
-        match self.runtime.block_on(self.inner.read(
-            &req.into(),
-            ino,
-            fh,
-            offset,
-            size,
-            flags,
-            lock_owner,
-            &mut buf,
-        )) {
-            Ok(()) => reply.data(&buf),
-            Err(e) => reply.error(e),
-        }
+        let context: RequestContext = req.into();
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            let mut buf = vec![];
+            match inner
+                .read(&context, ino, fh, offset, size, flags, lock_owner, &mut buf)
+                .await
+            {
+                Ok(()) => reply.data(&buf),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request,
+        &self,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let builder = DirEntListBuilder {
-            entries: &mut reply,
-        };
-        match self
-            .runtime
-            .block_on(self.inner.readdir(&_req.into(), ino, fh, offset, builder))
-        {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
+        let context: RequestContext = req.into();
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            let builder = DirEntListBuilder {
+                entries: &mut reply,
+            };
+            match inner.readdir(&context, ino, fh, offset, builder).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            }
+        });
     }
 }
 
 /// Experimental async API. Expect this to change in the future
 #[async_trait::async_trait]
-pub trait AsyncFilesystem {
+pub trait AsyncFilesystem: Send + Sync + 'static {
     async fn lookup(
         &self,
         context: &RequestContext,

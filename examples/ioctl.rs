@@ -3,13 +3,11 @@
 //   cargo run --example ioctl --features abi-7-11 /tmp/foobar
 
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
-use clap::Arg;
-use clap::ArgAction;
-use clap::Command;
-use clap::crate_version;
+use clap::Parser;
 use fuser::Errno;
 use fuser::FileAttr;
 use fuser::FileHandle;
@@ -28,13 +26,28 @@ use fuser::ReplyIoctl;
 use fuser::Request;
 use log::debug;
 
+#[derive(Parser)]
+#[command(version, author = "Colin Marc")]
+struct Args {
+    /// Act as a client, and mount FUSE at given path
+    mount_point: PathBuf,
+
+    /// Automatically unmount on process exit
+    #[clap(long)]
+    auto_unmount: bool,
+
+    /// Allow root user to access filesystem
+    #[clap(long)]
+    allow_root: bool,
+}
+
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
 const FIOC_GET_SIZE: u64 = nix::request_code_read!('E', 0, size_of::<usize>());
 const FIOC_SET_SIZE: u64 = nix::request_code_write!('E', 1, size_of::<usize>());
 
 struct FiocFS {
-    content: Vec<u8>,
+    content: std::sync::Mutex<Vec<u8>>,
     root_attr: FileAttr,
     fioc_file_attr: FileAttr,
 }
@@ -81,7 +94,7 @@ impl FiocFS {
         };
 
         Self {
-            content: vec![],
+            content: std::sync::Mutex::new(vec![]),
             root_attr,
             fioc_file_attr,
         }
@@ -89,7 +102,7 @@ impl FiocFS {
 }
 
 impl Filesystem for FiocFS {
-    fn lookup(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent == INodeNo::ROOT && name.to_str() == Some("fioc") {
             reply.entry(&TTL, &self.fioc_file_attr, fuser::Generation(0));
         } else {
@@ -97,7 +110,7 @@ impl Filesystem for FiocFS {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match ino.0 {
             1 => reply.attr(&TTL, &self.root_attr),
             2 => reply.attr(&TTL, &self.fioc_file_attr),
@@ -106,7 +119,7 @@ impl Filesystem for FiocFS {
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
@@ -117,14 +130,15 @@ impl Filesystem for FiocFS {
         reply: ReplyData,
     ) {
         if ino == INodeNo(2) {
-            reply.data(&self.content[offset as usize..]);
+            let content = self.content.lock().unwrap();
+            reply.data(&content[offset as usize..]);
         } else {
             reply.error(Errno::ENOENT);
         }
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
@@ -152,7 +166,7 @@ impl Filesystem for FiocFS {
     }
 
     fn ioctl(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
@@ -169,12 +183,13 @@ impl Filesystem for FiocFS {
 
         match cmd.into() {
             FIOC_GET_SIZE => {
-                let size_bytes = self.content.len().to_ne_bytes();
+                let content = self.content.lock().unwrap();
+                let size_bytes = content.len().to_ne_bytes();
                 reply.ioctl(0, &size_bytes);
             }
             FIOC_SET_SIZE => {
                 let new_size = usize::from_ne_bytes(in_data.try_into().unwrap());
-                self.content = vec![0_u8; new_size];
+                *self.content.lock().unwrap() = vec![0_u8; new_size];
                 reply.ioctl(0, &[]);
             }
             _ => {
@@ -186,40 +201,17 @@ impl Filesystem for FiocFS {
 }
 
 fn main() {
-    let matches = Command::new("hello")
-        .version(crate_version!())
-        .author("Colin Marc")
-        .arg(
-            Arg::new("MOUNT_POINT")
-                .required(true)
-                .index(1)
-                .help("Act as a client, and mount FUSE at given path"),
-        )
-        .arg(
-            Arg::new("auto_unmount")
-                .long("auto_unmount")
-                .action(ArgAction::SetTrue)
-                .help("Automatically unmount on process exit"),
-        )
-        .arg(
-            Arg::new("allow-root")
-                .long("allow-root")
-                .action(ArgAction::SetTrue)
-                .help("Allow root user to access filesystem"),
-        )
-        .get_matches();
-
+    let args = Args::parse();
     env_logger::init();
 
-    let mountpoint = matches.get_one::<String>("MOUNT_POINT").unwrap();
     let mut options = vec![MountOption::FSName("fioc".to_string())];
-    if matches.get_flag("auto_unmount") {
+    if args.auto_unmount {
         options.push(MountOption::AutoUnmount);
     }
-    if matches.get_flag("allow-root") {
+    if args.allow_root {
         options.push(MountOption::AllowRoot);
     }
 
     let fs = FiocFS::new();
-    fuser::mount2(fs, mountpoint, &options).unwrap();
+    fuser::mount2(fs, &args.mount_point, &options).unwrap();
 }

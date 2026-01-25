@@ -6,31 +6,9 @@ use std::sync::Weak;
 use log::error;
 
 use crate::dev_fuse::DevFuse;
-
-#[repr(C)]
-struct fuse_backing_map {
-    fd: u32,
-    flags: u32,
-    padding: u64,
-}
-
-const FUSE_DEV_IOC_MAGIC: u8 = 229;
-const FUSE_DEV_IOC_BACKING_OPEN: u8 = 1;
-const FUSE_DEV_IOC_BACKING_CLOSE: u8 = 2;
-
-nix::ioctl_write_ptr!(
-    fuse_dev_ioc_backing_open,
-    FUSE_DEV_IOC_MAGIC,
-    FUSE_DEV_IOC_BACKING_OPEN,
-    fuse_backing_map
-);
-
-nix::ioctl_write_ptr!(
-    fuse_dev_ioc_backing_close,
-    FUSE_DEV_IOC_MAGIC,
-    FUSE_DEV_IOC_BACKING_CLOSE,
-    u32
-);
+use crate::ll::ioctl::fuse_backing_map;
+use crate::ll::ioctl::fuse_dev_ioc_backing_close;
+use crate::ll::ioctl::fuse_dev_ioc_backing_open;
 
 /// A reference to a previously opened fd intended to be used for passthrough
 ///
@@ -58,6 +36,13 @@ pub struct BackingId {
 
 impl BackingId {
     pub(crate) fn create(channel: &Arc<DevFuse>, fd: impl AsFd) -> std::io::Result<Self> {
+        if !cfg!(target_os = "linux") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "backing IDs are only supported on Linux",
+            ));
+        }
+
         let map = fuse_backing_map {
             fd: fd.as_fd().as_raw_fd() as u32,
             flags: 0,

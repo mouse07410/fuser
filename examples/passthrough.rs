@@ -4,23 +4,19 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::ffi::c_int;
 use std::fs::File;
-use std::rc::Rc;
-use std::rc::Weak;
+use std::path::PathBuf;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
-use clap::Arg;
-use clap::ArgAction;
-use clap::Command;
-use clap::crate_version;
+use clap::Parser;
 use fuser::BackingId;
 use fuser::Errno;
 use fuser::FileAttr;
 use fuser::FileHandle;
 use fuser::FileType;
 use fuser::Filesystem;
+use fuser::FopenFlags;
 use fuser::INodeNo;
 use fuser::InitFlags;
 use fuser::KernelConfig;
@@ -33,6 +29,21 @@ use fuser::ReplyEmpty;
 use fuser::ReplyEntry;
 use fuser::ReplyOpen;
 use fuser::Request;
+
+#[derive(Parser)]
+#[command(version, author = "Allison Karlitskaya")]
+struct Args {
+    /// Act as a client, and mount FUSE at given path
+    mount_point: PathBuf,
+
+    /// Automatically unmount on process exit
+    #[clap(long)]
+    auto_unmount: bool,
+
+    /// Allow root user to access filesystem
+    #[clap(long)]
+    allow_root: bool,
+}
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
@@ -53,7 +64,7 @@ const TTL: Duration = Duration::from_secs(1); // 1 second
 /// desired, but our little example filesystem only contains one file. :)
 #[derive(Debug, Default)]
 struct BackingCache {
-    by_handle: HashMap<u64, Rc<BackingId>>,
+    by_handle: HashMap<u64, Arc<BackingId>>,
     by_inode: HashMap<INodeNo, Weak<BackingId>>,
     next_fh: u64,
 }
@@ -72,20 +83,20 @@ impl BackingCache {
         &mut self,
         ino: INodeNo,
         callback: impl Fn() -> std::io::Result<BackingId>,
-    ) -> std::io::Result<(u64, Rc<BackingId>)> {
+    ) -> std::io::Result<(u64, Arc<BackingId>)> {
         let fh = self.next_fh();
 
         let id = if let Some(id) = self.by_inode.get(&ino).and_then(Weak::upgrade) {
             eprintln!("HIT! reusing {id:?}");
             id
         } else {
-            let id = Rc::new(callback()?);
-            self.by_inode.insert(ino, Rc::downgrade(&id));
+            let id = Arc::new(callback()?);
+            self.by_inode.insert(ino, Arc::downgrade(&id));
             eprintln!("MISS! new {id:?}");
             id
         };
 
-        self.by_handle.insert(fh, Rc::clone(&id));
+        self.by_handle.insert(fh, Arc::clone(&id));
         Ok((fh, id))
     }
 
@@ -100,11 +111,15 @@ impl BackingCache {
     }
 }
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
+
 #[derive(Debug)]
 struct PassthroughFs {
     root_attr: FileAttr,
     passthrough_file_attr: FileAttr,
-    backing_cache: BackingCache,
+    backing_cache: Mutex<BackingCache>,
 }
 
 impl PassthroughFs {
@@ -151,17 +166,13 @@ impl PassthroughFs {
         Self {
             root_attr,
             passthrough_file_attr,
-            backing_cache: BackingCache::default(),
+            backing_cache: Mutex::new(BackingCache::default()),
         }
     }
 }
 
 impl Filesystem for PassthroughFs {
-    fn init(
-        &mut self,
-        _req: &Request,
-        config: &mut KernelConfig,
-    ) -> std::result::Result<(), c_int> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         config
             .add_capabilities(InitFlags::FUSE_PASSTHROUGH)
             .unwrap();
@@ -169,7 +180,7 @@ impl Filesystem for PassthroughFs {
         Ok(())
     }
 
-    fn lookup(&mut self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent == INodeNo::ROOT && name.to_str() == Some("passthrough") {
             reply.entry(&TTL, &self.passthrough_file_attr, fuser::Generation(0));
         } else {
@@ -177,7 +188,7 @@ impl Filesystem for PassthroughFs {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match ino.0 {
             1 => reply.attr(&TTL, &self.root_attr),
             2 => reply.attr(&TTL, &self.passthrough_file_attr),
@@ -185,7 +196,7 @@ impl Filesystem for PassthroughFs {
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         if ino != INodeNo(2) {
             reply.error(Errno::ENOENT);
             return;
@@ -193,6 +204,8 @@ impl Filesystem for PassthroughFs {
 
         let (fh, id) = self
             .backing_cache
+            .lock()
+            .unwrap()
             .get_or(ino, || {
                 let file = File::open("/etc/profile")?;
                 reply.open_backing(file)
@@ -200,25 +213,25 @@ impl Filesystem for PassthroughFs {
             .unwrap();
 
         eprintln!("  -> opened_passthrough({fh:?}, 0, {id:?});\n");
-        reply.opened_passthrough(fh, 0, &id);
+        reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id);
     }
 
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
         _ino: INodeNo,
         _fh: FileHandle,
-        _flags: i32,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.backing_cache.put(_fh.into());
+        self.backing_cache.lock().unwrap().put(_fh.into());
         reply.ok();
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
@@ -247,40 +260,20 @@ impl Filesystem for PassthroughFs {
 }
 
 fn main() {
-    let matches = Command::new("hello")
-        .version(crate_version!())
-        .author("Allison Karlitskaya")
-        .arg(
-            Arg::new("MOUNT_POINT")
-                .required(true)
-                .index(1)
-                .help("Act as a client, and mount FUSE at given path"),
-        )
-        .arg(
-            Arg::new("auto_unmount")
-                .long("auto_unmount")
-                .action(ArgAction::SetTrue)
-                .help("Automatically unmount on process exit"),
-        )
-        .arg(
-            Arg::new("allow-root")
-                .long("allow-root")
-                .action(ArgAction::SetTrue)
-                .help("Allow root user to access filesystem"),
-        )
-        .get_matches();
-
+    let args = Args::parse();
     env_logger::init();
 
-    let mountpoint = matches.get_one::<String>("MOUNT_POINT").unwrap();
     let mut options = vec![MountOption::FSName("passthrough".to_string())];
-    if matches.get_flag("auto_unmount") {
+    if args.auto_unmount {
         options.push(MountOption::AutoUnmount);
     }
-    if matches.get_flag("allow-root") {
+    if args.allow_root {
         options.push(MountOption::AllowRoot);
+    }
+    if options.contains(&MountOption::AutoUnmount) && !options.contains(&MountOption::AllowRoot) {
+        options.push(MountOption::AllowOther);
     }
 
     let fs = PassthroughFs::new();
-    fuser::mount2(fs, mountpoint, &options).unwrap();
+    fuser::mount2(fs, &args.mount_point, &options).unwrap();
 }
